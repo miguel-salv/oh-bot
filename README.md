@@ -10,9 +10,12 @@ notification whenever a new student joins the queue.
    ```bash
    python -m venv venv
    source venv/bin/activate
-   pip install python-socketio requests python-dotenv playwright
+   pip install -r requirements.txt
    playwright install chromium
    ```
+
+   OHQ speaks Engine.IO 3. `requirements.txt` keeps `python-socketio` on 4.x,
+   which is the client that can complete that handshake.
 
 2. Create a `.env` file in the project root:
 
@@ -39,7 +42,11 @@ notification whenever a new student joins the queue.
    `QUEUE_CLOSE_TIME` are the window, in 24-hour Eastern time. The close time
    has to be later on the same day. The bot re-reads these when `.env` changes,
    so you do not have to restart it. Leave them out to keep Sunday–Thursday,
-   5:00pm–8:00pm.
+   5:00pm–8:00pm. The 2026–27 CMU calendar is built in: the queue stays closed
+   outside fall and spring, including finals' surrounding breaks, and on Labor
+   Day, fall break, Thanksgiving, spring break, and Spring Carnival. Democracy
+   Day is not skipped, because evening classes after 5:00pm still meet. Add
+   more days with `QUEUE_SKIP_DATES=2026-10-05`.
 
 3. Log in once so later refreshes can reuse the browser profile:
 
@@ -60,13 +67,24 @@ source venv/bin/activate
 python oh_bot.py
 ```
 
+On the Pi, leave it running in the background instead:
+
+```bash
+./bot.sh start
+./bot.sh log
+./bot.sh stop
+```
+
+`start` does nothing if `oh_bot.py` is already running, including after the
+reboot cron job. `log` follows `oh_bot.log`, and `Ctrl+C` only stops the
+viewer.
+
 The bot connects to the OHQ Socket.IO server and posts to Discord when someone
 joins the queue. If the session cookie expires, it opens the saved browser
 profile and writes a new `cookie.txt` when CMU still accepts that login. When a
 real login is required, it sends a one-time link to the private channel. If that
-link expires, it sends a new one 30 minutes later. While
-the queue connection is up, it posts "Still connected." there once an hour.
-While automatic open is enabled, it opens course 12 on the configured Eastern
+link expires, it sends a new one 30 minutes later. While automatic open is
+enabled, it opens course 12 on the configured Eastern
 schedule. After the close time it waits until nobody is left on the queue, then
 closes it. The private channel is told only after OHQ confirms the change.
 Starting the bot during that window opens the queue immediately. The account

@@ -192,18 +192,21 @@ def save_cookie(header):
     print("Saved fresh cookie to cookie.txt")
 
 
+def on_ohq(page):
+    parsed = urlparse(page.url)
+    return parsed.scheme == "https" and parsed.hostname == "ohq.eberly.cmu.edu"
+
+
 def session_header(context):
     for cookie in context.cookies():
-        domain = cookie.get("domain", "")
-        if cookie["name"] == "session_id" and cookie["value"] and "eberly.cmu.edu" in domain:
+        if cookie["name"] == "session_id" and cookie["value"]:
             return f"session_id={cookie['value']}"
     return None
 
 
 def live_session_header(page):
     """Return the OHQ session header when /user accepts it and the page is OHQ."""
-    parsed = urlparse(page.url)
-    if parsed.scheme != "https" or parsed.hostname != "ohq.eberly.cmu.edu":
+    if not on_ohq(page):
         return None
     header = session_header(page.context)
     if not header:
@@ -212,7 +215,7 @@ def live_session_header(page):
         resp = page.request.get(
             OHQ_URL + "/user",
             max_redirects=0,
-            timeout=15000,
+            timeout=5000,
         )
     except Exception as e:
         print(f"Session check failed: {e}")
@@ -404,6 +407,8 @@ class ReauthHandler(BaseHTTPRequestHandler):
         label = action or "page"
         if token is None:
             label = "unknown"
+        if label in {"shot", "status"}:
+            return
         print(f"reauth {self.command} {label}")
 
     def do_GET(self):
@@ -623,8 +628,11 @@ def serve_reauth(page):
             now = time.time()
             if now - last_check >= 2:
                 last_check = now
-                header = live_session_header(page)
-                if header and header != PREVIOUS_COOKIE:
+                if on_ohq(page):
+                    header = session_header(page.context)
+                else:
+                    header = None
+                if header:
                     save_cookie(header)
                     STATE["done"] = True
                     time.sleep(2)
@@ -646,19 +654,22 @@ def main():
     global PREVIOUS_COOKIE
     load_dotenv()
     PREVIOUS_COOKIE = load_previous_cookie()
+    print("Opening the saved browser...", flush=True)
     with sync_playwright() as playwright:
         context, page = open_browser(playwright)
         try:
+            print("Loading OHQ...", flush=True)
             page.goto(OHQ_URL, wait_until="domcontentloaded", timeout=45000)
             header = wait_for_new_session(page, SILENT_WAIT_SECONDS)
             if not header and session_header(context):
+                print("Saved session was rejected. Loading OHQ again...", flush=True)
                 clear_session_cookie(context)
                 page.goto(OHQ_URL, wait_until="domcontentloaded", timeout=45000)
                 header = wait_for_new_session(page, SILENT_WAIT_SECONDS)
             if header:
                 save_cookie(header)
                 return EXIT_SILENT
-            print("Saved profile is not logged in. Opening the one-time login page.")
+            print("Saved profile is not logged in. Opening the one-time login page.", flush=True)
             return serve_reauth(page)
         finally:
             context.close()

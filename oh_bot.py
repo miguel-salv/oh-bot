@@ -3,7 +3,7 @@ import sys
 import time
 import logging
 import subprocess
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import socketio
@@ -22,7 +22,6 @@ DISCORD_ALERT_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK_URL")
 
 # Set by connect_error when the server rejects our auth, read by the main loop
 auth_failed = False
-HEARTBEAT_SECONDS = 60 * 60
 # refresh_cookie.py exits 2 after you finish the one-time login page, and 3 when that link expires.
 EXIT_INTERACTIVE = 2
 EXIT_EXPIRED = 3
@@ -40,7 +39,26 @@ DAY_NAMES = {
 }
 WEEKDAY_ORDER = (6, 0, 1, 2, 3, 4, 5)
 WEEKDAY_LABELS = {6: "Sun", 0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat"}
-DEFAULT_QUEUE_SCHEDULE = (True, frozenset({6, 0, 1, 2, 3}), (17, 0), (20, 0))
+# Fall 2026 through makeup finals, then spring 2027 through makeup finals.
+# Summer is left closed. Official no-class days inside the terms are skipped.
+DEFAULT_TERMS = (
+    (date(2026, 8, 24), date(2026, 12, 14)),
+    (date(2027, 1, 19), date(2027, 5, 11)),
+)
+DEFAULT_SKIP_DATES = frozenset({
+    date(2026, 9, 7),  # Labor Day
+    date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14),
+    date(2026, 10, 15), date(2026, 10, 16),  # Fall break
+    date(2026, 11, 25), date(2026, 11, 26), date(2026, 11, 27),  # Thanksgiving
+    date(2027, 1, 18),  # Martin Luther King Jr. Day
+    date(2027, 3, 8), date(2027, 3, 9), date(2027, 3, 10),
+    date(2027, 3, 11), date(2027, 3, 12),  # Spring break
+    date(2027, 4, 15), date(2027, 4, 16), date(2027, 4, 17),  # Spring Carnival
+})
+DEFAULT_QUEUE_SCHEDULE = (
+    True, frozenset({6, 0, 1, 2, 3}), (17, 0), (20, 0),
+    DEFAULT_SKIP_DATES, DEFAULT_TERMS,
+)
 _SCHEDULE_UNSET = object()
 _schedule_mtime = _SCHEDULE_UNSET
 _schedule = DEFAULT_QUEUE_SCHEDULE
@@ -156,13 +174,27 @@ def parse_hhmm(text, key):
     return hour, minute
 
 
+def parse_dates(text):
+    dates = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            dates.add(date.fromisoformat(part))
+        except ValueError:
+            raise ValueError(f"QUEUE_SKIP_DATES entries must be YYYY-MM-DD, got {part!r}") from None
+    return dates
+
+
 def parse_queue_schedule(values):
-    """Return (enabled, weekdays, open_at, close_at) from .env values."""
+    """Return (enabled, weekdays, open_at, close_at, skip_dates, terms)."""
     enabled_text = values.get("QUEUE_AUTO_OPEN")
     days_text = values.get("QUEUE_OPEN_DAYS")
     open_text = values.get("QUEUE_OPEN_TIME")
     close_text = values.get("QUEUE_CLOSE_TIME")
-    enabled, weekdays, open_at, close_at = DEFAULT_QUEUE_SCHEDULE
+    extra_skip_text = values.get("QUEUE_SKIP_DATES")
+    enabled, weekdays, open_at, close_at, skip_dates, terms = DEFAULT_QUEUE_SCHEDULE
     if enabled_text is not None:
         enabled = parse_enabled(enabled_text)
     if days_text is not None:
@@ -171,19 +203,24 @@ def parse_queue_schedule(values):
         open_at = parse_hhmm(open_text, "QUEUE_OPEN_TIME")
     if close_text is not None:
         close_at = parse_hhmm(close_text, "QUEUE_CLOSE_TIME")
+    if extra_skip_text is not None:
+        skip_dates = frozenset(set(skip_dates) | parse_dates(extra_skip_text))
     if enabled and open_at >= close_at:
         raise ValueError("QUEUE_CLOSE_TIME must be later the same day than QUEUE_OPEN_TIME")
-    return enabled, weekdays, open_at, close_at
+    return enabled, weekdays, open_at, close_at, skip_dates, terms
 
 
 def describe_schedule(schedule):
-    enabled, weekdays, open_at, close_at = schedule
+    enabled, weekdays, open_at, close_at, _skip_dates, _terms = schedule
     if not enabled:
         return "Queue auto-open is off."
     days = ", ".join(WEEKDAY_LABELS[day] for day in WEEKDAY_ORDER if day in weekdays)
     open_label = f"{open_at[0]:02d}:{open_at[1]:02d}"
     close_label = f"{close_at[0]:02d}:{close_at[1]:02d}"
-    return f"Queue auto-open is on, {days}, {open_label}–{close_label} Eastern."
+    return (
+        f"Queue auto-open is on, {days}, {open_label}–{close_label} Eastern, "
+        "skipping CMU 2026-27 breaks."
+    )
 
 
 def current_queue_schedule(path=".env"):
@@ -212,8 +249,13 @@ def current_queue_schedule(path=".env"):
     return _schedule
 
 
-def queue_should_be_open(now, weekdays, open_at, close_at):
-    """True from open_at until close_at Eastern on the configured weekdays."""
+def queue_should_be_open(now, weekdays, open_at, close_at, skip_dates, terms):
+    """True from open_at until close_at Eastern on configured weekdays in term."""
+    today = now.date()
+    if not any(start <= today <= end for start, end in terms):
+        return False
+    if today in skip_dates:
+        return False
     if now.weekday() not in weekdays:
         return False
     current = (now.hour, now.minute)
@@ -236,10 +278,12 @@ def remember_queue_open(data):
 def sync_queue_open(sio):
     """Open or close course 12 so it matches the schedule in .env."""
     global pending_queue_target, last_queue_emit
-    enabled, weekdays, open_at, close_at = current_queue_schedule()
+    enabled, weekdays, open_at, close_at, skip_dates, terms = current_queue_schedule()
     if not enabled:
         return
-    desired = queue_should_be_open(datetime.now(EASTERN), weekdays, open_at, close_at)
+    desired = queue_should_be_open(
+        datetime.now(EASTERN), weekdays, open_at, close_at, skip_dates, terms,
+    )
     # Outside the window, wait until OHQ tells us the queue is actually open.
     if queue_is_open is None and not desired:
         return
@@ -312,7 +356,6 @@ def build_client():
 
 def run_forever():
     global auth_failed, questions_seen
-    last_heartbeat = None
 
     while True:
         auth_failed = False
@@ -347,10 +390,6 @@ def run_forever():
                 break
             if not sio.connected:
                 break
-            now = time.time()
-            if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_SECONDS:
-                notify_alert("Still connected.")
-                last_heartbeat = now
             sync_queue_open(sio)
 
         if auth_failed:
