@@ -1,4 +1,5 @@
 cookie.txt
+browser_profile/
 .env
 venv/
 __pycache__/
