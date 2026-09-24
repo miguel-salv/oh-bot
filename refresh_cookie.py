@@ -650,9 +650,30 @@ def serve_reauth(page):
         SERVER = None
 
 
+def visible_login():
+    """Open a normal browser window and wait for Enter. No saved profile or login page."""
+    print("Log in with your Andrew ID + Duo in the browser window.")
+    print("Once you see the actual queue/course page, come back here and press Enter.")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=False)
+        page = browser.new_page()
+        try:
+            page.goto(OHQ_URL)
+            input()
+            header = session_header(page.context)
+            if not header:
+                raise RuntimeError("No session_id cookie found. Finish login, then press Enter.")
+            save_cookie(header)
+        finally:
+            browser.close()
+    return EXIT_INTERACTIVE
+
+
 def main():
     global PREVIOUS_COOKIE
     load_dotenv()
+    if not os.environ.get("REAUTH_BASE_URL", "").strip():
+        return visible_login()
     PREVIOUS_COOKIE = load_previous_cookie()
     print("Opening the saved browser...", flush=True)
     with sync_playwright() as playwright:

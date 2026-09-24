@@ -56,7 +56,7 @@ DEFAULT_SKIP_DATES = frozenset({
     date(2027, 4, 15), date(2027, 4, 16), date(2027, 4, 17),  # Spring Carnival
 })
 DEFAULT_QUEUE_SCHEDULE = (
-    True, frozenset({6, 0, 1, 2, 3}), (17, 0), (20, 0),
+    False, frozenset({6, 0, 1, 2, 3}), (17, 0), (20, 0),
     DEFAULT_SKIP_DATES, DEFAULT_TERMS,
 )
 _SCHEDULE_UNSET = object()
@@ -98,7 +98,12 @@ def notify_alert(msg):
 
 
 def refresh_session_cookie():
-    """Blocks until cookie.txt is refreshed from the saved browser profile or the login page."""
+    """Blocks until cookie.txt is refreshed.
+
+    With REAUTH_BASE_URL unset, refresh_cookie.py opens a visible browser and
+    waits for Enter. With it set, the saved browser profile or the one-time
+    login page is used instead.
+    """
     print("\n=== Refreshing OHQ session. ===")
     result = subprocess.run([sys.executable, "refresh_cookie.py"], check=False)
     if result.returncode == 0:
