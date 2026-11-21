@@ -5,6 +5,7 @@ import logging
 import subprocess
 import threading
 from datetime import date, datetime
+from queue import SimpleQueue
 from zoneinfo import ZoneInfo
 
 import socketio
@@ -16,8 +17,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 seen_ids = set()
-questions_lock = threading.Lock()
-queue_meta_lock = threading.Lock()
+queue_lock = threading.Lock()
+notifications = SimpleQueue()
 COURSE_ID = "12"
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
@@ -152,6 +153,15 @@ def notify_discord(entry):
             delay = 2
         if attempt < 2:
             time.sleep(delay)
+
+
+def deliver_notifications():
+    while True:
+        send, value = notifications.get()
+        try:
+            send(value)
+        except Exception:
+            logging.exception("Could not deliver Discord notification")
 
 
 def read_env_values(path):
@@ -302,11 +312,11 @@ def remember_queue_open(data):
     payload = data.get("payload") if isinstance(data, dict) else None
     if not payload or "open" not in payload[0]:
         return
-    with queue_meta_lock:
+    with queue_lock:
         new_open = bool(payload[0]["open"])
         if pending_queue_target is not None and new_open == pending_queue_target:
             if new_open != queue_is_open:
-                notify_alert("Queue opened." if new_open else "Queue closed.")
+                notifications.put((notify_alert, "Queue opened." if new_open else "Queue closed."))
             pending_queue_target = None
         queue_is_open = new_open
 
@@ -322,45 +332,57 @@ def sync_queue_open(sio):
     )
     if not desired and not auto_close:
         return
-    # Outside the window, wait until OHQ tells us the queue is actually open.
-    if queue_is_open is None and not desired:
-        return
-    if queue_is_open == desired:
-        return
-    # A close waits until this connection has seen a question list with nobody waiting.
-    if not desired and (not questions_seen or seen_ids):
-        return
-    if time.time() - last_queue_emit < QUEUE_EMIT_COOLDOWN:
-        return
+    with queue_lock:
+        # A close requires both fresh open metadata and an empty question list.
+        if not desired and (queue_is_open is None or not questions_seen or seen_ids):
+            return
+        if queue_is_open == desired:
+            return
+        sent_at = time.monotonic()
+        if last_queue_emit and sent_at - last_queue_emit < QUEUE_EMIT_COOLDOWN:
+            return
+        last_queue_emit = sent_at
+        pending_queue_target = desired
     event = "open_queue" if desired else "close_queue"
     try:
         sio.emit(event, namespace="/queue")
     except Exception as e:
+        with queue_lock:
+            if last_queue_emit == sent_at and pending_queue_target == desired:
+                pending_queue_target = None
+                last_queue_emit = 0.0
         print(f"Queue {event} failed: {e}")
-        return
-    last_queue_emit = time.time()
-    pending_queue_target = desired
 
 
 def handle_questions(data):
     global seen_ids, questions_seen
-    with questions_lock:
-        entries = data.get("payload", [])
-        current_ids = {e["id"] for e in entries if e["state"] == "on_queue"}
+    entries = data.get("payload") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return
+    with queue_lock:
+        waiting = {entry["id"]: entry for entry in entries if entry["state"] == "on_queue"}
+        current_ids = set(waiting)
         new_ids = current_ids - seen_ids
-
-        for entry in entries:
-            if entry["id"] in new_ids:
-                notify_discord(entry)
-
         seen_ids = current_ids
         questions_seen = True
+        for entry_id, entry in waiting.items():
+            if entry_id in new_ids:
+                notifications.put((notify_discord, entry))
+
+
+def reset_queue_connection():
+    global queue_is_open, pending_queue_target, last_queue_emit, questions_seen
+    with queue_lock:
+        queue_is_open = None
+        pending_queue_target = None
+        last_queue_emit = 0.0
+        questions_seen = False
 
 
 def build_client():
     """Creates a fresh Socket.IO client with all handlers attached.
     Rebuilt on each reconnect attempt rather than reusing one client instance."""
-    sio = socketio.Client(logger=False, engineio_logger=False)
+    sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False)
 
     @sio.on("questions_initial", namespace="/queue")
     def on_questions_initial(data):
@@ -394,11 +416,12 @@ def build_client():
 
 
 def run_forever():
-    global auth_failed, questions_seen
+    global auth_failed
 
+    threading.Thread(target=deliver_notifications, name="discord-notifications", daemon=True).start()
     while True:
         auth_failed = False
-        questions_seen = False
+        reset_queue_connection()
         session_cookie = load_session_cookie()
 
         if session_cookie is None:

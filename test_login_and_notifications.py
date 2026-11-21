@@ -72,11 +72,19 @@ class AutomaticLoginTests(unittest.TestCase):
     def test_session_check_uses_ohq_api(self):
         self.page.url = "https://ohq.eberly.cmu.edu/"
         self.page.context.cookies.return_value = [{"name": "session_id", "value": "example"}]
-        self.page.request.get.return_value.status = 200
-        self.assertEqual(refresh_cookie.live_session_header(self.page), "session_id=example")
-        self.page.request.get.assert_called_once_with(
-            "https://ohq.eberly.cmu.edu/api/user", max_redirects=0, timeout=5000,
+        with patch.object(refresh_cookie.requests, "get", return_value=Mock(status_code=200)) as get:
+            self.assertEqual(refresh_cookie.live_session_header(self.page), "session_id=example")
+        self.page.context.cookies.assert_called_once_with("https://ohq.eberly.cmu.edu/api/user")
+        get.assert_called_once_with(
+            "https://ohq.eberly.cmu.edu/api/user",
+            headers={"Cookie": "session_id=example"}, allow_redirects=False, timeout=5,
         )
+
+    def test_rejects_session_redirect(self):
+        self.page.url = refresh_cookie.OHQ_URL
+        self.page.context.cookies.return_value = [{"name": "session_id", "value": "expired"}]
+        with patch.object(refresh_cookie.requests, "get", return_value=Mock(status_code=302)):
+            self.assertIsNone(refresh_cookie.live_session_header(self.page))
 
 
 class NotificationTests(unittest.TestCase):

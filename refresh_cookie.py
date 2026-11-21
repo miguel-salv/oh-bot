@@ -217,7 +217,7 @@ def brief_url(url):
 
 
 def session_header(context):
-    for cookie in context.cookies():
+    for cookie in context.cookies(OHQ_URL + "/api/user"):
         if cookie["name"] == "session_id" and cookie["value"]:
             return f"session_id={cookie['value']}"
     return None
@@ -231,15 +231,16 @@ def live_session_header(page):
     if not header:
         return None
     try:
-        resp = page.request.get(
+        resp = requests.get(
             OHQ_URL + "/api/user",
-            max_redirects=0,
-            timeout=5000,
+            headers={"Cookie": header},
+            allow_redirects=False,
+            timeout=5,
         )
-    except Exception as e:
-        print(f"Session check failed: {e}")
+    except requests.RequestException as e:
+        print(f"Session check failed: {type(e).__name__}")
         return None
-    if resp.status != 200:
+    if resp.status_code != 200:
         return None
     return header
 
@@ -757,9 +758,9 @@ def visible_login():
         try:
             page.goto(OHQ_URL)
             input()
-            header = session_header(page.context)
+            header = live_session_header(page)
             if not header:
-                raise RuntimeError("No session_id cookie found. Finish login, then press Enter.")
+                raise RuntimeError("OHQ did not accept the session. Finish login, then press Enter.")
             save_cookie(header)
         finally:
             browser.close()
