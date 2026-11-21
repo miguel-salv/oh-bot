@@ -4,7 +4,7 @@ with open("cookie.txt") as f:
     SESSION_COOKIE = f.read().strip()
 
 resp = requests.get(
-    "https://ohq.eberly.cmu.edu/user",
+    "https://ohq.eberly.cmu.edu/api/user",
     headers={"Cookie": SESSION_COOKIE},
 )
 print(resp.status_code)

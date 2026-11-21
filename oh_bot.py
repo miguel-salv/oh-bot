@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import subprocess
+import threading
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 seen_ids = set()
+questions_lock = threading.Lock()
+queue_meta_lock = threading.Lock()
 COURSE_ID = "12"
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
@@ -56,7 +59,7 @@ DEFAULT_SKIP_DATES = frozenset({
     date(2027, 4, 15), date(2027, 4, 16), date(2027, 4, 17),  # Spring Carnival
 })
 DEFAULT_QUEUE_SCHEDULE = (
-    False, frozenset({6, 0, 1, 2, 3}), (17, 0), (20, 0),
+    False, True, frozenset({6, 0, 1, 2, 3}), (17, 0), (20, 0),
     DEFAULT_SKIP_DATES, DEFAULT_TERMS,
 )
 _SCHEDULE_UNSET = object()
@@ -124,10 +127,31 @@ def refresh_session_cookie():
 
 def notify_discord(entry):
     name = f'{entry["first_name"]} {entry["last_name"]}'.strip()
-    msg = f'🎓 **{name}** joined the queue — *{entry["topic"]}* ({entry["location"]})'
-    resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
-    if resp.status_code >= 300:
-        print(f"Discord post failed: {resp.status_code} {resp.text}")
+    msg = f'**{name}** joined the queue — *{entry["topic"]}*'
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"content": msg, "allowed_mentions": {"parse": []}},
+                timeout=10,
+            )
+            if resp.status_code < 300:
+                return
+            print(f"Discord post failed: {resp.status_code}")
+            if resp.status_code != 429 and resp.status_code < 500:
+                return
+            if resp.status_code == 429:
+                try:
+                    delay = min(max(float(resp.json().get("retry_after", 2)), 0), 30)
+                except (ValueError, TypeError, AttributeError):
+                    delay = 2
+            else:
+                delay = 2
+        except requests.RequestException as e:
+            print(f"Discord post failed: {type(e).__name__}")
+            delay = 2
+        if attempt < 2:
+            time.sleep(delay)
 
 
 def read_env_values(path):
@@ -146,13 +170,13 @@ def read_env_values(path):
     return values
 
 
-def parse_enabled(text):
+def parse_enabled(text, key="QUEUE_AUTO_OPEN"):
     value = text.strip().lower()
     if value in {"1", "true", "yes", "on"}:
         return True
     if value in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"QUEUE_AUTO_OPEN must be true or false, got {text!r}")
+    raise ValueError(f"{key} must be true or false, got {text!r}")
 
 
 def parse_days(text):
@@ -193,15 +217,18 @@ def parse_dates(text):
 
 
 def parse_queue_schedule(values):
-    """Return (enabled, weekdays, open_at, close_at, skip_dates, terms)."""
+    """Return (enabled, auto_close, weekdays, open_at, close_at, skip_dates, terms)."""
     enabled_text = values.get("QUEUE_AUTO_OPEN")
+    auto_close_text = values.get("QUEUE_AUTO_CLOSE")
     days_text = values.get("QUEUE_OPEN_DAYS")
     open_text = values.get("QUEUE_OPEN_TIME")
     close_text = values.get("QUEUE_CLOSE_TIME")
     extra_skip_text = values.get("QUEUE_SKIP_DATES")
-    enabled, weekdays, open_at, close_at, skip_dates, terms = DEFAULT_QUEUE_SCHEDULE
+    enabled, auto_close, weekdays, open_at, close_at, skip_dates, terms = DEFAULT_QUEUE_SCHEDULE
     if enabled_text is not None:
         enabled = parse_enabled(enabled_text)
+    if auto_close_text is not None:
+        auto_close = parse_enabled(auto_close_text, "QUEUE_AUTO_CLOSE")
     if days_text is not None:
         weekdays = parse_days(days_text)
     if open_text is not None:
@@ -212,20 +239,23 @@ def parse_queue_schedule(values):
         skip_dates = frozenset(set(skip_dates) | parse_dates(extra_skip_text))
     if enabled and open_at >= close_at:
         raise ValueError("QUEUE_CLOSE_TIME must be later the same day than QUEUE_OPEN_TIME")
-    return enabled, weekdays, open_at, close_at, skip_dates, terms
+    return enabled, auto_close, weekdays, open_at, close_at, skip_dates, terms
 
 
 def describe_schedule(schedule):
-    enabled, weekdays, open_at, close_at, _skip_dates, _terms = schedule
+    enabled, auto_close, weekdays, open_at, close_at, _skip_dates, _terms = schedule
     if not enabled:
         return "Queue auto-open is off."
     days = ", ".join(WEEKDAY_LABELS[day] for day in WEEKDAY_ORDER if day in weekdays)
     open_label = f"{open_at[0]:02d}:{open_at[1]:02d}"
     close_label = f"{close_at[0]:02d}:{close_at[1]:02d}"
-    return (
+    description = (
         f"Queue auto-open is on, {days}, {open_label}–{close_label} Eastern, "
         "skipping CMU 2026-27 breaks."
     )
+    if not auto_close:
+        description += " Automatic closing is off; close the queue manually."
+    return description
 
 
 def current_queue_schedule(path=".env"):
@@ -272,23 +302,26 @@ def remember_queue_open(data):
     payload = data.get("payload") if isinstance(data, dict) else None
     if not payload or "open" not in payload[0]:
         return
-    new_open = bool(payload[0]["open"])
-    if pending_queue_target is not None and new_open == pending_queue_target:
-        if new_open != queue_is_open:
-            notify_alert("Queue opened." if new_open else "Queue closed.")
-        pending_queue_target = None
-    queue_is_open = new_open
+    with queue_meta_lock:
+        new_open = bool(payload[0]["open"])
+        if pending_queue_target is not None and new_open == pending_queue_target:
+            if new_open != queue_is_open:
+                notify_alert("Queue opened." if new_open else "Queue closed.")
+            pending_queue_target = None
+        queue_is_open = new_open
 
 
 def sync_queue_open(sio):
-    """Open or close course 12 so it matches the schedule in .env."""
+    """Open on schedule, and close only when automatic closing is enabled."""
     global pending_queue_target, last_queue_emit
-    enabled, weekdays, open_at, close_at, skip_dates, terms = current_queue_schedule()
+    enabled, auto_close, weekdays, open_at, close_at, skip_dates, terms = current_queue_schedule()
     if not enabled:
         return
     desired = queue_should_be_open(
         datetime.now(EASTERN), weekdays, open_at, close_at, skip_dates, terms,
     )
+    if not desired and not auto_close:
+        return
     # Outside the window, wait until OHQ tells us the queue is actually open.
     if queue_is_open is None and not desired:
         return
@@ -311,16 +344,17 @@ def sync_queue_open(sio):
 
 def handle_questions(data):
     global seen_ids, questions_seen
-    entries = data.get("payload", [])
-    current_ids = {e["id"] for e in entries if e["state"] == "on_queue"}
-    new_ids = current_ids - seen_ids
+    with questions_lock:
+        entries = data.get("payload", [])
+        current_ids = {e["id"] for e in entries if e["state"] == "on_queue"}
+        new_ids = current_ids - seen_ids
 
-    for entry in entries:
-        if entry["id"] in new_ids:
-            notify_discord(entry)
+        for entry in entries:
+            if entry["id"] in new_ids:
+                notify_discord(entry)
 
-    seen_ids = current_ids
-    questions_seen = True
+        seen_ids = current_ids
+        questions_seen = True
 
 
 def build_client():
@@ -383,7 +417,11 @@ def run_forever():
             )
         except Exception as e:
             print(f"Connection attempt failed: {e}")
-            time.sleep(5)
+            sio.disconnect()
+            if auth_failed:
+                refresh_session_cookie()
+            else:
+                time.sleep(5)
             continue
 
         # Poll instead of sio.wait(), so we can notice an auth failure

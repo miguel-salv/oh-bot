@@ -23,13 +23,18 @@ notification whenever a new student joins the queue.
    DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
    ```
 
-   On a headless machine such as a Pi, add the remote-login and schedule settings:
+   On a headless machine such as a Pi, install the remote-desktop packages and add the remote-login and schedule settings:
+
+   ```bash
+   sudo apt install xvfb x11vnc novnc websockify
+   ```
 
    ```
    DISCORD_ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/...
    REAUTH_PASSWORD=choose-a-password
    REAUTH_BASE_URL=http://100.x.x.x:8787
    QUEUE_AUTO_OPEN=true
+   QUEUE_AUTO_CLOSE=false
    QUEUE_OPEN_DAYS=Sun,Mon,Tue,Wed,Thu
    QUEUE_OPEN_TIME=17:00
    QUEUE_CLOSE_TIME=20:00
@@ -50,11 +55,15 @@ notification whenever a new student joins the queue.
    has to be later on the same day. The bot re-reads these when `.env` changes,
    so you do not have to restart it. Leave the window unset to keep
    Sunday–Thursday, 5:00pm–8:00pm. The 2026–27 CMU calendar is built in: once
-   automatic open is on, the queue stays closed outside fall and spring,
+   automatic open is on, the bot skips opening outside fall and spring,
    including finals' surrounding breaks, and on Labor Day, fall break,
    Thanksgiving, spring break, and Spring Carnival. Democracy Day is not
    skipped, because evening classes after 5:00pm still meet. Add more days
    with `QUEUE_SKIP_DATES=2026-10-05`.
+   Set `QUEUE_AUTO_CLOSE=false` to keep scheduled opening but disable automatic
+   closing, including on breaks and outside the configured window. Close the
+   queue manually when finished. This setting also reloads when `.env` changes.
+   Automatic closing defaults to `true` if the setting is omitted.
 
 3. Log in once:
 
@@ -69,9 +78,9 @@ notification whenever a new student joins the queue.
    With `REAUTH_BASE_URL` set, Chromium stays headless and stores its profile in
    `browser_profile/`. If that profile is already logged in, this writes
    `cookie.txt` and exits. Otherwise it posts a one-time link to the private
-   Discord channel. Open the link, enter `REAUTH_PASSWORD`, then finish Andrew
-   ID and Duo on that page. The link expires in 15 minutes and stops working
-   after a successful login.
+   Discord channel and opens the saved browser on a virtual screen. Open the
+   link, enter `REAUTH_PASSWORD`, and type into the Andrew form on that screen.
+   The link expires in 15 minutes and stops working after a successful login.
 
 ## Running
 
@@ -97,16 +106,47 @@ joins the queue. If the session cookie expires and `REAUTH_BASE_URL` is unset,
 it opens a browser window for you to log in again. With `REAUTH_BASE_URL` set,
 it opens the saved browser profile and writes a new `cookie.txt` when CMU still
 accepts that login. When a real login is required, it sends a one-time link to
-the private channel. If that link expires, it sends a new one 30 minutes later.
+the private channel. That page is a remote view of the Pi's browser, so Andrew
+ID and password are typed into the form itself. If that link expires, it sends
+a new one 30 minutes later.
 With `QUEUE_AUTO_OPEN=true`, it opens course 12 on the configured Eastern
 schedule. After the close time it waits until nobody is left on the queue, then
 closes it. The private channel is told only after OHQ confirms the change.
+Set `QUEUE_AUTO_CLOSE=false` to leave it open until you close it manually.
 Starting the bot during that window opens the queue immediately. The account
 in the saved browser profile is the one OHQ sees.
 Leaving `QUEUE_AUTO_OPEN` unset, or setting it to `false`, stops the bot from
 opening or closing the queue.
 `browser_profile/` holds the Andrew session and the Duo remember-this-browser
 cookie when remote login is configured. Do not commit it.
+
+### Optional automatic Andrew login
+
+For remote login, the bot can enter your Andrew ID and password when the CMU
+single-page login form appears. It only submits to `https://login.cmu.edu`.
+Duo approval remains interactive. Other login forms fall back to the existing
+private Discord login link. CMU can change its login page, so this may need
+adjustment if its form changes.
+
+Install the updated Python requirements, then configure a system keyring for
+the same OS user and session that runs the bot. On Linux this requires a working,
+unlocked Secret Service keyring (for example GNOME Keyring over the user's
+D-Bus session); a headless cron job may not have access to it. Do not configure
+an unencrypted or plaintext keyring backend. Check the backend with
+`python -m keyring --list-backends` and test access from the bot's own runtime.
+Then run:
+
+```bash
+python setup_andrew_login.py
+```
+
+Enter the password at the hidden prompt. The command saves your Andrew ID in
+`.env` and stores the password in the keyring, not `.env`. The bot falls back
+to the login link if the keyring is unavailable. It attempts saved credentials
+only once until a successful login or another run of the setup command; this
+prevents repeated attempts with a stale password. Update the keyring using the
+same command after a password change. A successful login clears that limit.
+Do not paste your password into Discord or the bot's configuration.
 
 By default the bot watches the course with ID `12`. Change `COURSE_ID` in
 `oh_bot.py` to watch a different course.

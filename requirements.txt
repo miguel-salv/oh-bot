@@ -3,3 +3,5 @@ python-engineio>=3.13,<4
 requests
 python-dotenv
 playwright
+keyring
+secretstorage; sys_platform == "linux"

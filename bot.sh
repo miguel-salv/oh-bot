@@ -6,6 +6,10 @@ bot_pids() {
     pgrep -f '[p]ython oh_bot.py' || true
 }
 
+refresh_pids() {
+    pgrep -f '[p]ython refresh_cookie.py' || true
+}
+
 case "${1:-}" in
 start)
     if [ -n "$(bot_pids)" ]; then
@@ -17,21 +21,24 @@ start)
     ;;
 stop)
     pids=$(bot_pids)
-    if [ -z "$pids" ]; then
+    rpids=$(refresh_pids)
+    if [ -z "$pids" ] && [ -z "$rpids" ]; then
         echo "Not running."
         exit 0
     fi
-    kill $pids || true
+    # shellcheck disable=SC2086
+    kill $pids $rpids || true
     i=0
     while [ "$i" -lt 10 ]; do
-        if [ -z "$(bot_pids)" ]; then
+        if [ -z "$(bot_pids)" ] && [ -z "$(refresh_pids)" ]; then
             echo "Stopped."
             exit 0
         fi
         sleep 0.5
         i=$((i + 1))
     done
-    kill -9 $(bot_pids) || true
+    # shellcheck disable=SC2046
+    kill -9 $(bot_pids) $(refresh_pids) || true
     echo "Stopped."
     ;;
 log)
